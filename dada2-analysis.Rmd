@@ -1,0 +1,304 @@
+---
+title: "supernova 16s Notebook"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+```{r}
+library(dada2)
+library(decontam)
+library(ggplot2)
+library(jsonlite)
+library(lattice)
+library(reshape)
+library(zoo)
+PROJECT_DIR = "/home/rpetit/projects/supernova-16s"
+setwd(PROJECT_DIR)
+```
+
+# Input FASTQs
+Input FASTQs had adapters removed using BBDuk prior to DADA2 analysis. This was accomplished with the following command:
+```{bash eval=FALSE, include=FALSE}
+cd /home/rpetit/projects/supernova-16s
+ls data/fastq/ | \
+    grep "R1" | \
+    sed 's/_L001_R1_001.fastq.gz//' | \
+    awk '{print $1" data/fastq/"$1"_L001_R1_001.fastq.gz data/fastq/"$1"_L001_R2_001.fastq.gz data/adapter-cleaned"}' | \
+    xargs -I {} sh -c 'scripts/remove-adapters.sh {}'
+```
+
+The adapter cleaned FASTQ files were stored in `data/adapter-cleaned` 
+
+# Dada2 Analysis
+## Setting Up Files and Naming
+```{r}
+# Input FASTQs
+fastq_path = paste0(PROJECT_DIR, "/data/adapter-cleaned")
+fastq_r1 <- sort(
+  list.files(fastq_path, pattern="_R1.fastq.gz", full.names = TRUE)
+)
+fastq_r2 <- sort(
+  list.files(fastq_path, pattern="_R2.fastq.gz", full.names = TRUE)
+)
+sample_names <- sapply(strsplit(basename(fastq_r1), "_"), `[`, 1)
+```
+
+## Plot Project FASTQ Quality Profile
+```{r fig.width=12, fig.asp=0.5}
+json_r1 <- sort(list.files(fastq_path, pattern="_R1.json", full.names = TRUE))
+json_r2 <- sort(list.files(fastq_path, pattern="_R2.json", full.names = TRUE))
+r1_profile = NULL
+r2_profile = NULL
+for (i in 1:length(json_r1)){
+  r1_df = as.data.frame(fromJSON(txt=json_r1[i])$per_base_quality)
+  r2_df = as.data.frame(fromJSON(txt=json_r2[i])$per_base_quality)
+  if (is.null(r1_profile)) {
+    r1_profile = r1_df
+    r2_profile = r2_df
+  }
+  else {
+    r1_profile = rbind(r1_profile, r1_df)
+    r2_profile = rbind(r2_profile, r2_df)
+  }
+}
+
+colnames(r1_profile) <- as.integer(gsub("X", "", colnames(r1_profile)))
+colnames(r2_profile) <- as.integer(gsub("X", "", colnames(r2_profile)))
+means = data.frame(
+  position=1:ncol(r1_profile), 
+  R1=as.data.frame(colMeans(r1_profile))[,1],
+  R2=as.data.frame(colMeans(r2_profile))[,1]
+)
+means$"R1 Rolling Mean" <- rollmean(means$R1, 5, fill="extend")
+means$"R2 Rolling Mean" <- rollmean(means$R2, 5, fill="extend")
+melted_vals = melt(
+  means,
+  id.vars = "position",
+  measure.vars = c("R1", "R2", "R1 Rolling Mean", "R2 Rolling Mean")
+)
+p <- ggplot(melted_vals, aes(x=position, y=value)) + 
+  geom_line() +
+  facet_wrap(~ variable, ncol=2) +
+  xlab("Base Position") +
+  ylab("PHRED Score")
+print(p)
+```
+With these plots, we can get a general idea of the per-base mean quality across all samples in the project. There are two plots for forward (R1) and reverse (R2) reads. The top plots ("R1" and "R2") are the per-base mean quality across all samples, and the bottom plots ("R1 Rolling Mean" and "R2 Rolling Mean") use a rolling mean that is based on a centered 5bp sliding window.
+
+As expected the quality tails off in the R2 reads, but overall the quality is good.
+
+## Plot Sample FASTQ Quality Profiles (Subset)
+```{r fig.width=12, fig.asp=0.25, message=FALSE, warning=FALSE}
+for (i in 1:2) {
+  print(plotQualityProfile(c(fastq_r1[i], fastq_r2[i])))
+}
+```
+
+## Filter and Trim
+For this project the V1 and V2 region of the 16s rRNA gene was sequenced. This region is roughly ~360bp and our project includes 2x250 Illumina MiSeq sequencing. For filtering and trimming we need to maintain a total length greater than 360bp plus a 20bp overlap, so ~380bp. Given 2x250bp reads, this gives 120bp to play with for trimming.
+
+```{r}
+# Filter and Trim
+filt_r1 <- file.path(
+  PROJECT_DIR, "data", "filtered", paste0(sample_names, "_R1_filt.fastq.gz")
+)
+filt_r2 <- file.path(
+  PROJECT_DIR, "data", "filtered", paste0(sample_names, "_R2_filt.fastq.gz")
+)
+names(filt_r1) <- sample_names
+names(filt_r2) <- sample_names
+out <- as.data.frame(
+  filterAndTrim(fastq_r1, filt_r1, fastq_r2, filt_r2, truncLen=c(250,210),
+                minLen=190, maxN=0, maxEE=c(2,5), truncQ=2, rm.phix=TRUE,
+                compress=TRUE, multithread=TRUE)
+)
+filtered_stats <- out
+colnames(filtered_stats) <- c("input", "filtered")
+rownames(filtered_stats) <- sample_names
+filtered_stats$percent_filtered_out <- 1 - (filtered_stats$filtered / filtered_stats$input)
+```
+
+Using the quality profile of the complete set of samples, the following parameters were using for fitering and trimming:
+
+| Parameters            | Description                                                              |
+|-----------------------|--------------------------------------------------------------------------|
+| `truncLen=c(250,210)` | Trim length of forward (250bp) and reverse (210bp) reads                 |
+| `minLen=185`          | Remove reads that are less than 190bp after trimming                     |
+| `maxN=0`              | Filter reads containing ambiguous (e.g. N) base calls                    | 
+| `maxEE=c(2,5)`        | Filter reads with more than expected basecall errors (R1: 2, R2: 5)      |
+| `truncQ=2`            | Trim reads at the position with a PHRED score of Q2                      |
+| `rm.phix=TRUE`        | Remove any reads matching PhiX (Illumina control)                        |
+| `compress=TRUE`       | Gzip output FASTQs                                                       |
+| `multithread=TRUE`    | Use multiple processors                                                  | 
+
+Below is the top 10 samples with the most reads filtered out.
+
+```{r}
+head(filtered_stats[order(filtered_stats$percent_filtered_out, decreasing=TRUE),], n=10)
+```
+
+## Determine and Plot Error Rates
+```{r}
+error_r1 <- learnErrors(filt_r1, multithread=TRUE)
+```
+
+```{r}
+error_r2 <- learnErrors(filt_r2, multithread=TRUE)
+```
+
+```{r fig.width=12, message=FALSE, warning=FALSE}
+print(plotErrors(error_r1, nominalQ=TRUE))
+```
+
+In the plot above the dots are the observed error rates for each consensus quality score. The redline shows the expected error rates based and the black line fit to the observed error rates.
+
+## Sample Inference (Denoise)
+```{r}
+dada_r1 <- dada(filt_r1, err=error_r1, multithread=TRUE)
+```
+
+```{r}
+dada_r2 <- dada(filt_r2, err=error_r2, multithread=TRUE)
+```
+
+## Merge Reads and Construct Amplicon Sequence Variant (ASV) Table
+```{r}
+merged_reads <- mergePairs(dada_r1, filt_r1, dada_r2, filt_r2, verbose=TRUE)
+head(merged_reads[[1]])
+sequence_table <- makeSequenceTable(merged_reads)
+dim(sequence_table)
+table(nchar(getSequences(sequence_table)))
+print(histogram(nchar(getSequences(sequence_table)), nint=50, xlab="Sequence Length"))
+```
+
+Filter out merged reads that have a length that is not within 20bp of our expected ~360bp. These could be the result of non-specific priming.
+```{r}
+sequence_table <- sequence_table[,nchar(colnames(sequence_table)) %in% 340:380]
+table(nchar(getSequences(sequence_table)))
+print(histogram(nchar(getSequences(sequence_table)), nint=50, xlab="Sequence Length"))
+```
+
+## Remove Chimeras
+```{r}
+sequence_table_nochim <- removeBimeraDenovo(
+  sequence_table, method="consensus", multithread=TRUE, verbose=TRUE
+)
+```
+```{r}
+dim(sequence_table_nochim)
+```
+
+```{r}
+1 - (sum(sequence_table_nochim) / sum(sequence_table))
+```
+
+
+# Track Reads
+```{r}
+getN <- function(x) sum(getUniques(x))
+track <- as.data.frame(cbind(out, sapply(dada_r1, getN), sapply(dada_r2, getN), sapply(merged_reads, getN), rowSums(sequence_table_nochim)))
+colnames(track) <- c("input", "filtered", "denoisedR1", "denoisedR2", "merged", "nonchim")
+rownames(track) <- sample_names
+track$percent_filtered_out <- 1 - (track$filtered / track$input)
+track$percent_merged <- track$merged / track$filtered
+track$percent_nochim <- track$nonchim / track$merged
+head(track)
+```
+
+## Assign Taxonomy
+The [SILVA (v132)](https://zenodo.org/record/1172783#.XT7ZwpNKiL4) DADA2-formatted reference database was used to assign taxonomy (including species) to the ASVs. The SILVA (v132) DADA2 formatted databases are avialable at [DADA2 Reference Databases](https://benjjneb.github.io/dada2/training.html).
+```{r}
+taxa <- assignTaxonomy(
+  sequence_table_nochim, 
+  paste0(PROJECT_DIR, "/data/reference/silva_nr_v132_train_set.fa.gz"),
+  tryRC=TRUE,
+  multithread=TRUE
+)
+taxa <- addSpecies(
+  taxa, paste0(PROJECT_DIR, "/data/reference/silva_species_assignment_v132.fa.gz")
+)
+taxa.print <- taxa
+rownames(taxa.print) <- NULL
+head(taxa.print)
+```
+
+## Write Outputs
+### ASV FASTA
+```{r}
+asv_seqs <- colnames(sequence_table_nochim)
+asv_headers <- vector(dim(sequence_table_nochim)[2], mode="character")
+for (i in 1:dim(sequence_table_nochim)[2]) {
+  asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+write(asv_fasta, paste0(PROJECT_DIR, "/results/ASVs.fa"))
+```
+
+### ASV Counts and Taxonomy
+```{r}
+asv_tab <- t(sequence_table_nochim)
+row.names(asv_tab) <- sub(">", "", asv_headers)
+write.table(
+  asv_tab,
+  paste0(PROJECT_DIR, "/results/ASVs-counts.tsv"),
+  sep="\t",
+  quote=F,
+  col.names=NA
+)
+
+asv_tax <- taxa
+row.names(asv_tax) <- sub(">", "", asv_headers)
+write.table(
+  asv_tax, 
+  paste0(PROJECT_DIR, "/results/ASVs-taxonomy.tsv"),
+  sep="\t",
+  quote=F,
+  col.names=NA
+)
+```
+
+## Remove Contaminants
+Here [decontam](https://github.com/benjjneb/decontam) is used to identify likely contaminants using the included *BLANK* samples.
+```{r}
+vector_for_decontam <- grepl("BLANK", colnames(asv_tab))
+contam_asvs <- isContaminant(t(asv_tab), neg=vector_for_decontam)
+table(contam_asvs$contaminant)
+is_contaminant <- row.names(contam_asvs[contam_asvs$contaminant == TRUE,])
+asv_tax[row.names(asv_tax) %in% is_contaminant, ]
+```
+
+### Write Decontaminated Outputs
+```{r}
+contam_indices <- which(asv_fasta %in% paste0(">", is_contaminant))
+dont_want <- sort(c(contam_indices, contam_indices + 1))
+
+asv_fasta_no_contam <- asv_fasta[- dont_want]
+write(asv_fasta_no_contam, paste0(PROJECT_DIR, "/results/ASVs-decontam.fa"))
+
+asv_tab_no_contam <- asv_tab[!row.names(asv_tab) %in% is_contaminant, ]
+write.table(
+  asv_tab_no_contam,
+  paste0(PROJECT_DIR, "/results/ASVs-decontam-counts.tsv"),
+  sep="\t",
+  quote=F,
+  col.names=NA
+)
+
+asv_tax_no_contam <- asv_tax[!row.names(asv_tax) %in% is_contaminant, ]
+write.table(
+  asv_tax_no_contam,
+  paste0(PROJECT_DIR, "/results/ASVs-decontam-taxonomy.tsv"),
+  sep="\t",
+  quote=F,
+  col.names=NA
+)
+```
+
+
+## Plot Sample FASTQ Quality Profiles (Full Set)
+```{r fig.width=12, fig.asp=0.25, message=FALSE, warning=FALSE}
+for (i in 1:length(fastq_r1)) {
+  print(plotQualityProfile(c(fastq_r1[i], fastq_r2[i])))
+}
+```
