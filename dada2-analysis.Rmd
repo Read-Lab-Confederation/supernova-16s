@@ -1,20 +1,25 @@
 ---
 title: "supernova 16s Notebook"
 output:
-  pdf_document: default
+  html_document:
+    df_print: paged
   html_notebook: default
+  pdf_document: default
 ---
 
-```{r}
+```{r Setup Packages}
 library(dada2)
 library(decontam)
 library(ggplot2)
 library(jsonlite)
 library(lattice)
+library(lemon)
 library(reshape)
 library(zoo)
+knit_print.data.frame <- lemon_print
 PROJECT_DIR = "/home/rpetit/projects/supernova-16s"
 setwd(PROJECT_DIR)
+getN <- function(x) sum(getUniques(x))
 ```
 
 # Input FASTQs
@@ -32,7 +37,7 @@ The adapter cleaned FASTQ files were stored in `data/adapter-cleaned`
 
 # Dada2 Analysis
 ## Setting Up Files and Naming
-```{r}
+```{r Setup Naming}
 # Input FASTQs
 fastq_path = paste0(PROJECT_DIR, "/data/adapter-cleaned")
 fastq_r1 <- sort(
@@ -45,7 +50,7 @@ sample_names <- sapply(strsplit(basename(fastq_r1), "_"), `[`, 1)
 ```
 
 ## Plot Project FASTQ Quality Profile
-```{r fig.width=12, fig.asp=0.5}
+```{r Project Quality Profile, fig.width=12, fig.asp=0.5}
 json_r1 <- sort(list.files(fastq_path, pattern="_R1.json", full.names = TRUE))
 json_r2 <- sort(list.files(fastq_path, pattern="_R2.json", full.names = TRUE))
 r1_profile = NULL
@@ -89,17 +94,16 @@ With these plots, we can get a general idea of the per-base mean quality across 
 As expected the quality tails off in the R2 reads, but overall the quality is good.
 
 ## Plot Sample FASTQ Quality Profiles (Subset)
-```{r fig.width=12, fig.asp=0.25, message=FALSE, warning=FALSE}
-for (i in 1:2) {
-  print(plotQualityProfile(c(fastq_r1[i], fastq_r2[i])))
-}
+Below is an example of the quality profile for a single sample. At the end of this document you can find the quality profile for all `r length(sample_names)` samples available in this project.
+
+```{r Sample Quality Profile, fig.width=12, fig.asp=0.25, message=FALSE, warning=FALSE}
+print(plotQualityProfile(c(fastq_r1[1], fastq_r2[1])))
 ```
 
 ## Filter and Trim
 For this project the V1 and V2 region of the 16s rRNA gene was sequenced. This region is roughly ~360bp and our project includes 2x250 Illumina MiSeq sequencing. For filtering and trimming we need to maintain a total length greater than 360bp plus a 20bp overlap, so ~380bp. Given 2x250bp reads, this gives 120bp to play with for trimming.
 
-```{r}
-# Filter and Trim
+```{r filterAndTrim}
 filt_r1 <- file.path(
   PROJECT_DIR, "data", "filtered", paste0(sample_names, "_R1_filt.fastq.gz")
 )
@@ -111,7 +115,7 @@ names(filt_r2) <- sample_names
 out <- as.data.frame(
   filterAndTrim(fastq_r1, filt_r1, fastq_r2, filt_r2, truncLen=c(250,210),
                 minLen=190, maxN=0, maxEE=c(2,5), truncQ=2, rm.phix=TRUE,
-                compress=TRUE, multithread=TRUE)
+                compress=TRUE, multithread=TRUE, verbose=FALSE)
 )
 filtered_stats <- out
 colnames(filtered_stats) <- c("input", "filtered")
@@ -119,7 +123,7 @@ rownames(filtered_stats) <- sample_names
 filtered_stats$percent_filtered_out <- 1 - (filtered_stats$filtered / filtered_stats$input)
 ```
 
-Using the quality profile of the complete set of samples, the following parameters were using for fitering and trimming:
+Using the quality profile of the complete set of samples, the following parameters were using for `filterAndTrim` (fitering and trimming):
 
 | Parameters            | Description                                                              |
 |-----------------------|--------------------------------------------------------------------------|
@@ -131,84 +135,113 @@ Using the quality profile of the complete set of samples, the following paramete
 | `rm.phix=TRUE`        | Remove any reads matching PhiX (Illumina control)                        |
 | `compress=TRUE`       | Gzip output FASTQs                                                       |
 | `multithread=TRUE`    | Use multiple processors                                                  | 
+| `verbose=FALSE`       | Do not output status messages                                            | 
 
-Below is the top 10 samples with the most reads filtered out.
+```{r filterAndTrim Histogram, fig.width=12, message=FALSE, warning=FALSE}
+print(histogram(
+  filtered_stats$percent_filtered_out,
+  nint=50,
+  type="count",
+  xlab="Percent of Reads Filtered Out"
+))
+summary(filtered_stats$percent_filtered_out)
+```
+Above is histogram and summary of the percentage of reads filtered out by `filterAndTrim` for each sample. Ideally it should be left-skewed, meaning most reads passed filtering and trimming and were not filtered out. If you find most of the reads are being filtered out, please review the `filterAndTrim` parameters used above. In cases were a large percentage of reads were filtered out, manual review might be necessary to determine the cause.
 
-```{r}
+Below is the top 10 samples with the most reads filtered out to review.
+```{r filterAndTrim Top 10}
 head(filtered_stats[order(filtered_stats$percent_filtered_out, decreasing=TRUE),], n=10)
 ```
 
 ## Determine and Plot Error Rates
-```{r}
-error_r1 <- learnErrors(filt_r1, multithread=TRUE)
-```
-
-```{r}
-error_r2 <- learnErrors(filt_r2, multithread=TRUE)
-```
-
-```{r fig.width=12, message=FALSE, warning=FALSE}
+```{r Determine Error Profile, fig.width=12, message=FALSE, warning=FALSE}
+error_r1 <- learnErrors(filt_r1, multithread=TRUE, verbose=FALSE)
+error_r2 <- learnErrors(filt_r2, multithread=TRUE, verbose=FALSE)
 print(plotErrors(error_r1, nominalQ=TRUE))
 ```
 
 In the plot above the dots are the observed error rates for each consensus quality score. The redline shows the expected error rates based and the black line fit to the observed error rates.
 
-## Sample Inference (Denoise)
-```{r}
-dada_r1 <- dada(filt_r1, err=error_r1, multithread=TRUE)
-```
-
-```{r}
-dada_r2 <- dada(filt_r2, err=error_r2, multithread=TRUE)
-```
-
-## Merge Reads and Construct Amplicon Sequence Variant (ASV) Table
-```{r}
+## Sample Inference (Denoise) and Merge Reads
+```{r Denoise and Merge, fig.width=12, message=FALSE, warning=FALSE}
+dada_r1 <- dada(filt_r1, err=error_r1, multithread=TRUE, verbose=FALSE)
+dada_r2 <- dada(filt_r2, err=error_r2, multithread=TRUE, verbose=FALSE)
 merged_reads <- mergePairs(dada_r1, filt_r1, dada_r2, filt_r2, verbose=TRUE)
-head(merged_reads[[1]])
-sequence_table <- makeSequenceTable(merged_reads)
-dim(sequence_table)
-table(nchar(getSequences(sequence_table)))
-print(histogram(nchar(getSequences(sequence_table)), nint=50, xlab="Sequence Length"))
+print(histogram(
+  sapply(merged_reads, getN) / filtered_stats$filtered,
+  nint=50,
+  endpoints=c(0,1),
+  type="count",
+  xlab="Percent of Reads Merged"
+))
+summary(sapply(merged_reads, getN) / filtered_stats$filtered)
 ```
 
-Filter out merged reads that have a length that is not within 20bp of our expected ~360bp. These could be the result of non-specific priming.
-```{r}
-sequence_table <- sequence_table[,nchar(colnames(sequence_table)) %in% 340:380]
-table(nchar(getSequences(sequence_table)))
-print(histogram(nchar(getSequences(sequence_table)), nint=50, xlab="Sequence Length"))
+For the above histogram (and summary stats), we are expecting it to be right-skewed, that is to say most of the read pairs were merged. If the percentage of read pairs merged is low across all samples, it might be necessary to review the parameters used with `filterAndTrim`. By default, `mergePairs` requires only a 12bp overlap to merge read pairs. Please keep this in mind if it does become necessary to adjust `filterAndTrim` parameters. 
+
+## Construct Amplicon Sequence Variant (ASV) Table
+```{r Construct ASV Table, fig.width=12, message=FALSE, warning=FALSE}
+original_sequence_table <- makeSequenceTable(merged_reads)
+print(histogram(
+  nchar(getSequences(original_sequence_table)), 
+  nint=50, 
+  type="count",
+  xlab="Sequence Length"
+))
+summary(nchar(getSequences(original_sequence_table)))
 ```
+
+The above histogram (and summary stats), is showing the distribution of ASV sequence lengths for the merged reads. For this project, V1 and V2 was sequenced which is expected to be around ~360bp. In our case we have ASV lengths spanning from `r min(nchar(getSequences(original_sequence_table)))`bp to `r max(nchar(getSequences(original_sequence_table)))`bp.
+
+Since some of these ASVs could be the result of non-specific priming, ASVs with lengths more than 20bp from the expected 360bp will be filtered out.
+```{r Construct ASV Table Filter, fig.width=12, message=FALSE, warning=FALSE}
+sequence_table <- original_sequence_table[,nchar(colnames(original_sequence_table)) %in% 340:380]
+
+print(histogram(
+  nchar(getSequences(sequence_table)), 
+  nint=50, 
+  type="count",
+  xlab="Sequence Length"
+))
+summary(nchar(getSequences(sequence_table)))
+```
+
+After filtering ASVs based on sequence lengths, we can see in the above histogram (and summary stats) all our ASVs fall within 20bp of the expected 360bp. Before filtering there were `r dim(original_sequence_table)[[2]]` ASVs, now after filtering there are `r dim(sequence_table)[[2]]` ASVs remaining.
+
 
 ## Remove Chimeras
-```{r}
+```{r Remove Chimeras, message=FALSE, warning=FALSE}
 sequence_table_nochim <- removeBimeraDenovo(
   sequence_table, method="consensus", multithread=TRUE, verbose=TRUE
 )
 ```
-```{r}
-dim(sequence_table_nochim)
-```
 
-```{r}
-1 - (sum(sequence_table_nochim) / sum(sequence_table))
-```
+During the process of removing chimeras, it is likely for a lot of ASVs to drop out. That is ok. What is important is the abundance that these chimeras account for. In our case, `r dim(sequence_table_nochim)[[2]]` ASVs, or `r (dim(sequence_table_nochim)[[2]] / dim(sequence_table)[[2]]) * 100`%, remain after identifying chimeras. These remaining ASVs account for `r (sum(sequence_table_nochim) / sum(sequence_table)) * 100`% of the merged reads and the ASVs marked as chimeras accounted for `r (1 - (sum(sequence_table_nochim) / sum(sequence_table))) * 100` of the merged reads.
 
+If you find that a majority of the merged reads were filtered as chimeras, it may be necessary to revisit the parameters used with `filterAndTrim`.
 
-# Track Reads
-```{r}
-getN <- function(x) sum(getUniques(x))
-track <- as.data.frame(cbind(out, sapply(dada_r1, getN), sapply(dada_r2, getN), sapply(merged_reads, getN), rowSums(sequence_table_nochim)))
+## Track Reads
+The following table will give an idea at which steps reads were lost throughout the analysis. Reviewing this table might be helpful to determine if it is necessary to revisit parameters used during the analysis.
+```{r Track Reads, message=FALSE, warning=FALSE}
+track <- as.data.frame(cbind(
+  out,
+  sapply(dada_r1, getN),
+  sapply(dada_r2, getN),
+  sapply(merged_reads, getN),
+  rowSums(sequence_table_nochim)
+))
 colnames(track) <- c("input", "filtered", "denoisedR1", "denoisedR2", "merged", "nonchim")
 rownames(track) <- sample_names
 track$percent_filtered_out <- 1 - (track$filtered / track$input)
 track$percent_merged <- track$merged / track$filtered
 track$percent_nochim <- track$nonchim / track$merged
-head(track)
+print(track)
 ```
 
+
 ## Assign Taxonomy
-The [SILVA (v132)](https://zenodo.org/record/1172783#.XT7ZwpNKiL4) DADA2-formatted reference database was used to assign taxonomy (including species) to the ASVs. The SILVA (v132) DADA2 formatted databases are avialable at [DADA2 Reference Databases](https://benjjneb.github.io/dada2/training.html).
-```{r}
+The [SILVA (v132)](https://zenodo.org/record/1172783#.XT7ZwpNKiL4) DADA2-formatted reference database was used to assign taxonomy (including species) to the ASVs. The SILVA (v132) DADA2 formatted databases are available at [DADA2 Reference Databases](https://benjjneb.github.io/dada2/training.html).
+```{r Assign Taxonomy, message=FALSE, warning=FALSE}
 taxa <- assignTaxonomy(
   sequence_table_nochim, 
   paste0(PROJECT_DIR, "/data/reference/silva_nr_v132_train_set.fa.gz"),
@@ -216,32 +249,23 @@ taxa <- assignTaxonomy(
   multithread=TRUE
 )
 taxa <- addSpecies(
-  taxa, paste0(PROJECT_DIR, "/data/reference/silva_species_assignment_v132.fa.gz")
+  taxa,
+  paste0(PROJECT_DIR, "/data/reference/silva_species_assignment_v132.fa.gz")
 )
-taxa.print <- taxa
-rownames(taxa.print) <- NULL
-head(taxa.print)
-```
 
-## Write Outputs
-### ASV FASTA
-```{r}
 asv_seqs <- colnames(sequence_table_nochim)
 asv_headers <- vector(dim(sequence_table_nochim)[2], mode="character")
 for (i in 1:dim(sequence_table_nochim)[2]) {
   asv_headers[i] <- paste(">ASV", i, sep="_")
 }
 asv_fasta <- c(rbind(asv_headers, asv_seqs))
-write(asv_fasta, paste0(PROJECT_DIR, "/results/ASVs.fa"))
-```
+write(asv_fasta, paste0(PROJECT_DIR, "/results/ASVs-withcontams.fa"))
 
-### ASV Counts and Taxonomy
-```{r}
 asv_tab <- t(sequence_table_nochim)
 row.names(asv_tab) <- sub(">", "", asv_headers)
 write.table(
   asv_tab,
-  paste0(PROJECT_DIR, "/results/ASVs-counts.tsv"),
+  paste0(PROJECT_DIR, "/results/ASVs-withcontams-counts.tsv"),
   sep="\t",
   quote=F,
   col.names=NA
@@ -251,25 +275,40 @@ asv_tax <- taxa
 row.names(asv_tax) <- sub(">", "", asv_headers)
 write.table(
   asv_tax, 
-  paste0(PROJECT_DIR, "/results/ASVs-taxonomy.tsv"),
+  paste0(PROJECT_DIR, "/results/ASVs-withcontams-taxonomy.tsv"),
   sep="\t",
   quote=F,
   col.names=NA
 )
+
+taxa_print <- as.data.frame(taxa)
+rownames(taxa_print) <- NULL
+head(taxa_print)
 ```
 
+Taxonomy was assigned to `r nrow(taxa_print)` ASVs, of these, `r nrow(taxa_print[!is.na(taxa_print$Species), ])` also had a species assigned. The results of these assignments were written to the following files:
+
+**ASV Sequences (FASTA)**  
+Each ASV sequence was written to *results/ASVs-withcontams.fa* in FASTA format
+
+
+**ASV Counts Per Sample**  
+A TSV of the count for each ASV within each sample was written to *results/ASVs-withcontams-counts.tsv*
+
+
+**Taxonomy Assignment Per ASV**  
+The taxonomic assignment for each ASV (similar to the table above) was written to *results/ASVs-withcontams-taxonomy.tsv*
+
+
 ## Remove Contaminants
-Here [decontam](https://github.com/benjjneb/decontam) is used to identify likely contaminants using the included *BLANK* samples.
-```{r}
+[decontam](https://github.com/benjjneb/decontam) is used to identify ASVs that are likely contaminants. decontam includes [two methods to identify contaminants](https://benjjneb.github.io/decontam/vignettes/decontam_intro.html), frequency and prevalence. In this analysis, the prevalence method is used. This method compares the *prevalence* (presence/absence across samples) of each ASV in true positive samples against negative controls (e.g. *BLANK* samples) to identify contaminants.
+
+```{r decontam, message=FALSE, warning=FALSE}
 vector_for_decontam <- grepl("BLANK", colnames(asv_tab))
 contam_asvs <- isContaminant(t(asv_tab), neg=vector_for_decontam)
 table(contam_asvs$contaminant)
 is_contaminant <- row.names(contam_asvs[contam_asvs$contaminant == TRUE,])
 asv_tax[row.names(asv_tax) %in% is_contaminant, ]
-```
-
-### Write Decontaminated Outputs
-```{r}
 contam_indices <- which(asv_fasta %in% paste0(">", is_contaminant))
 dont_want <- sort(c(contam_indices, contam_indices + 1))
 
@@ -296,8 +335,22 @@ write.table(
 ```
 
 
+`r nrow(contam_asvs[contam_asvs$contaminant == TRUE,])` ASVs were identified as contaminants and their taxonmic assignments were filtered out. The decontaminated results were written to the following files:
+
+**ASV Sequences (FASTA)**  
+Each decontaminated ASV sequence was written to *results/ASVs-decontam.fa* in FASTA format
+
+
+**ASV Counts Per Sample**  
+A TSV of the count for each decontaminated ASV within each sample was written to *results/ASVs-decontam-counts.tsv*
+
+
+**Taxonomy Assignment Per ASV**  
+The taxonomic assignment for each decontaminated ASV (similar to the table above) was written to *results/ASVs-decontam-taxonomy.tsv*
+
+
 ## Plot Sample FASTQ Quality Profiles (Full Set)
-```{r fig.width=12, fig.asp=0.25, message=FALSE, warning=FALSE}
+```{r Full Set Quality Profile, fig.width=12, fig.asp=0.25, message=FALSE, warning=FALSE}
 for (i in 1:length(fastq_r1)) {
   print(plotQualityProfile(c(fastq_r1[i], fastq_r2[i])))
 }
